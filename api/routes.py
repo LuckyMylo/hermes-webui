@@ -13332,16 +13332,31 @@ def handle_post(handler, parsed) -> bool:
         except (TypeError, ValueError) as e:
             return bad(handler, str(e))
         worktree_info = None
-        worktree_requested = (
+        protected_project = None
+        explicit_worktree = (
             body.get("worktree") is True
             or str(body.get("worktree")).strip().lower() in {"1", "true", "yes", "on"}
         )
+        explicit_no_worktree = (
+            body.get("worktree") is False
+            or str(body.get("worktree")).strip().lower() in {"0", "false", "no", "off"}
+        )
+        try:
+            from api.protected_projects import protected_project_for_workspace, should_auto_worktree
+            base_workspace = workspace
+            if not base_workspace:
+                base_workspace = str(resolve_trusted_workspace(get_last_workspace()))
+            protected_project = protected_project_for_workspace(base_workspace)
+            worktree_requested = should_auto_worktree(
+                base_workspace,
+                explicit_worktree=explicit_worktree,
+                explicit_no_worktree=explicit_no_worktree,
+            )
+        except (TypeError, ValueError) as e:
+            return bad(handler, str(e), status=400)
         if worktree_requested:
             try:
                 from api.worktrees import create_worktree_for_workspace
-                base_workspace = workspace
-                if not base_workspace:
-                    base_workspace = str(resolve_trusted_workspace(get_last_workspace()))
                 worktree_info = create_worktree_for_workspace(base_workspace)
                 workspace = worktree_info["path"]
             except (TypeError, ValueError) as e:
@@ -13428,7 +13443,14 @@ def handle_post(handler, parsed) -> bool:
                 profile=getattr(s, "profile", None),
                 session_id=getattr(s, "session_id", None),
             )
-        return j(handler, {"session": s.compact() | {"messages": s.messages}})
+        session_payload = s.compact() | {"messages": s.messages}
+        if protected_project:
+            from api.protected_projects import protected_project_payload
+            session_payload["protected_project"] = protected_project_payload(
+                protected_project,
+                auto_worktree_applied=bool(worktree_info and not explicit_worktree),
+            )
+        return j(handler, {"session": session_payload})
 
     if parsed.path == "/api/session/compression-recovery/start":
         return _handle_session_compression_recovery_start(handler, body)

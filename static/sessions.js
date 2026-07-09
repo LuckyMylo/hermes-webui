@@ -1228,6 +1228,12 @@ async function newSession(flash, options={}){
       _clearEmptyComposerModelOverride();
     }
     S.session=data.session;S.messages=data.session.messages||[];
+    const protectedProject=S.session&&S.session.protected_project;
+    if(protectedProject&&protectedProject.auto_worktree_applied&&typeof showToast==='function'){
+      const label=protectedProject.name||protectedProject.id||'Protected project';
+      const branch=S.session.worktree_branch||'';
+      showToast(`Isolated worktree created for ${label}${branch?`: ${branch}`:''}`,4200,'success');
+    }
     S._pendingSessionToolsets=null;
     if(_sessionSourceFilter==='cli') _sessionSourceFilter='webui';
     if(typeof _hydrateTodosFromSession==='function') _hydrateTodosFromSession(S.session);
