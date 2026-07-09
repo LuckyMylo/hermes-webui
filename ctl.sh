@@ -330,6 +330,26 @@ _proc_args() {
   fi
 }
 
+_is_repo_webui_pid() {
+  local pid="$1" repo="${2:-${REPO_ROOT}}" args args_slash repo_slash="" repo_win="" repo_win_slash=""
+  _is_alive "${pid}" || return 1
+  repo="$(cd "${repo}" 2>/dev/null && pwd || printf '%s' "${repo}")"
+  repo_slash="${repo//\\//}"
+  if _is_windows_bash; then
+    repo_win="$(cygpath -w "${repo}" 2>/dev/null || true)"
+    repo_win_slash="${repo_win//\\//}"
+  fi
+  args="$(_proc_args "${pid}")"
+  [[ -n "${args}" ]] || return 1
+  args_slash="${args//\\//}"
+  [[ "${args_slash}" == *"${repo_slash}/bootstrap.py"* ||
+     "${args_slash}" == *"${repo_slash}/server.py"* ||
+     "${args_slash}" == *"${repo_slash}/start.sh"* ||
+     ( -n "${repo_win_slash}" && "${args_slash}" == *"${repo_win_slash}/bootstrap.py"* ) ||
+     ( -n "${repo_win_slash}" && "${args_slash}" == *"${repo_win_slash}/server.py"* ) ||
+     ( -n "${repo_win_slash}" && "${args_slash}" == *"${repo_win_slash}/start.sh"* ) ]]
+}
+
 _is_owned_webui_pid() {
   local pid="$1" args args_slash state_repo="" state_repo_slash="" state_repo_win="" state_repo_win_slash="" state_python="" state_python_slash="" state_python_bash=""
   [[ -f "${STATE_FILE}" ]] || return 1
@@ -349,18 +369,53 @@ _is_owned_webui_pid() {
   args="$(_proc_args "${pid}")"
   [[ -n "${args}" ]] || return 1
   args_slash="${args//\\//}"
-  [[ "${args_slash}" == *"${state_repo_slash}/bootstrap.py"* ||
-     "${args_slash}" == *"${state_repo_slash}/server.py"* ||
-     "${args_slash}" == *"${state_repo_slash}/start.sh"* ||
-     ( -n "${state_repo_win_slash}" && "${args_slash}" == *"${state_repo_win_slash}/bootstrap.py"* ) ||
-     ( -n "${state_repo_win_slash}" && "${args_slash}" == *"${state_repo_win_slash}/server.py"* ) ||
-     ( -n "${state_repo_win_slash}" && "${args_slash}" == *"${state_repo_win_slash}/start.sh"* ) ||
-     ( -n "${state_python}" && "${args}" == *"${state_python}"* ) ||
+  _is_repo_webui_pid "${pid}" "${state_repo}" ||
+  [[ ( -n "${state_python}" && "${args}" == *"${state_python}"* ) ||
      ( -n "${state_python_slash}" && "${args_slash}" == *"${state_python_slash}"* ) ||
      ( -n "${state_python_bash}" && "${args_slash}" == *"${state_python_bash}"* ) ]]
 }
 
-_current_pid() {
+_discover_webui_pid_on_port() {
+  local host="$1" port="$2" pid="" line
+  [[ "${port}" =~ ^[0-9]+$ ]] || return 1
+
+  if command -v lsof >/dev/null 2>&1; then
+    while IFS= read -r pid; do
+      [[ "${pid}" =~ ^[0-9]+$ ]] || continue
+      if _is_repo_webui_pid "${pid}" "${REPO_ROOT}"; then
+        printf '%s\n' "${pid}"
+        return 0
+      fi
+    done < <(lsof -nP -tiTCP:"${port}" -sTCP:LISTEN 2>/dev/null | sort -u)
+  fi
+
+  if command -v ss >/dev/null 2>&1; then
+    while IFS= read -r line; do
+      [[ "${line}" == *":${port} "* || "${line}" == *":${port}" ]] || continue
+      while [[ "${line}" =~ pid=([0-9]+) ]]; do
+        pid="${BASH_REMATCH[1]}"
+        if _is_repo_webui_pid "${pid}" "${REPO_ROOT}"; then
+          printf '%s\n' "${pid}"
+          return 0
+        fi
+        line="${line#*pid=${pid}}"
+      done
+    done < <(ss -ltnp 2>/dev/null || true)
+  fi
+
+  return 1
+}
+
+_recover_running_pid_from_port() {
+  local host="${1:-${HERMES_WEBUI_HOST:-127.0.0.1}}" port="${2:-${HERMES_WEBUI_PORT:-8787}}" pid python_exe=""
+  pid="$(_discover_webui_pid_on_port "${host}" "${port}")" || return 1
+  python_exe="$(ps -p "${pid}" -o comm= 2>/dev/null || true)"
+  printf '%s\n' "${pid}" > "${PID_FILE}"
+  _write_state "${pid}" "${host}" "${port}" "${python_exe}"
+  printf '%s\n' "${pid}"
+}
+
+_current_pid_from_file() {
   local pid
   pid="$(_pid_from_file)" || return 1
   if _is_alive "${pid}" && _is_owned_webui_pid "${pid}"; then
@@ -368,6 +423,16 @@ _current_pid() {
     return 0
   fi
   return 1
+}
+
+_current_pid() {
+  local host port
+  if _current_pid_from_file; then
+    return 0
+  fi
+  host="${HOST:-${HERMES_WEBUI_HOST:-127.0.0.1}}"
+  port="${PORT:-${HERMES_WEBUI_PORT:-8787}}"
+  _recover_running_pid_from_port "${host}" "${port}"
 }
 
 _clear_stale_pid() {
@@ -436,7 +501,7 @@ start_cmd() {
   export HERMES_WEBUI_PORT="${CTL_PORT}"
 
   local existing_pid
-  if existing_pid="$(_current_pid 2>/dev/null)"; then
+  if existing_pid="$(_current_pid_from_file 2>/dev/null)"; then
     echo "[ctl] Hermes WebUI is already running (PID ${existing_pid})"
     return 0
   fi

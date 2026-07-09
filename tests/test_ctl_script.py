@@ -1,5 +1,6 @@
 import os
 import shutil
+import socket
 import subprocess
 import sys
 import textwrap
@@ -532,6 +533,95 @@ def test_start_allows_alternate_port_while_launchd_job_runs_on_default(tmp_path)
             sleeper.wait(timeout=3)
         except subprocess.TimeoutExpired:
             sleeper.kill()
+
+
+def _free_tcp_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
+
+
+def test_status_recovers_running_server_when_pid_file_is_missing(tmp_path):
+    if sys.platform == "win32":
+        pytest.skip("ss/lsof process ownership discovery is a Unix ctl.sh path")
+
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    _seed_ctl_repo(repo_root)
+    port = _free_tcp_port()
+    server_py = repo_root / "server.py"
+    server_py.write_text(
+        textwrap.dedent(
+            """
+            import json
+            import os
+            import signal
+            import sys
+            from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+            class Handler(BaseHTTPRequestHandler):
+                def do_GET(self):
+                    if self.path == '/health':
+                        body = json.dumps({'status': 'ok', 'sessions': 0, 'active_streams': 0}).encode()
+                        self.send_response(200)
+                        self.send_header('Content-Type', 'application/json')
+                        self.send_header('Content-Length', str(len(body)))
+                        self.end_headers()
+                        self.wfile.write(body)
+                    else:
+                        self.send_response(404)
+                        self.end_headers()
+                def log_message(self, *args):
+                    pass
+
+            host = os.environ.get('HERMES_WEBUI_HOST', '127.0.0.1')
+            port = int(os.environ['HERMES_WEBUI_PORT'])
+            httpd = ThreadingHTTPServer((host, port), Handler)
+            signal.signal(signal.SIGTERM, lambda *_: (httpd.shutdown(), sys.exit(0)))
+            httpd.serve_forever()
+            """
+        ).lstrip(),
+        encoding="utf-8",
+    )
+
+    env = os.environ.copy()
+    env.update({"HERMES_WEBUI_HOST": "127.0.0.1", "HERMES_WEBUI_PORT": str(port)})
+    proc = subprocess.Popen(
+        [sys.executable, str(server_py)],
+        cwd=repo_root,
+        env=env,
+        **({"creationflags": subprocess.CREATE_NO_WINDOW} if sys.platform == "win32" else {}),
+    )
+    result = None
+    try:
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            result = run_ctl(
+                tmp_path,
+                "status",
+                env={"HERMES_WEBUI_PORT": str(port)},
+                repo_root=repo_root,
+                timeout=5,
+            )
+            if "— running" in result.stdout:
+                break
+            time.sleep(0.1)
+        else:
+            output = "" if result is None else result.stdout + result.stderr
+            raise AssertionError(output)
+
+        assert result.returncode == 0, result.stderr + result.stdout
+        assert "running" in result.stdout
+        assert f"PID:     {proc.pid}" in result.stdout
+        assert f"Bound:   127.0.0.1:{port}" in result.stdout
+        assert "Health:  ok" in result.stdout
+        assert (tmp_path / ".hermes" / "webui.pid").read_text(encoding="utf-8").strip() == str(proc.pid)
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            proc.kill()
 
 
 def test_logs_supports_non_following_line_count(tmp_path):
